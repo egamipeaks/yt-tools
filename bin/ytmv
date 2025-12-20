@@ -57,6 +57,12 @@ video_path_file="$(mktemp)"
 cleanup() { rm -f "$video_path_file"; }
 trap cleanup EXIT
 
+# Build metadata args - override title if custom name provided
+metadata_args=(--embed-metadata)
+if [[ -n "$custom_name" ]]; then
+  metadata_args+=(--replace-in-metadata "title" "^.+$" "$custom_name")
+fi
+
 # Download best video+audio into mp4 when possible
 # - Prefer mp4 (H.264/AAC) for wide compatibility, but fall back if needed.
 yt-dlp \
@@ -64,9 +70,9 @@ yt-dlp \
   --write-thumbnail \
   --convert-thumbnails jpg \
   --write-description \
-  --embed-metadata \
+  "${metadata_args[@]}" \
   --merge-output-format mp4 \
-  -f "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b" \
+  -f "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/bv*[height<=1080]+ba/b[height<=1080]" \
   -o "$output_template" \
   --print-to-file after_move:filepath "$video_path_file" \
   "$clean_url"
