@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ---- Load .env configuration ----
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || realpath "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
+ENV_FILE="$(dirname "$SCRIPT_DIR")/.env"
+
+if [[ -f "$ENV_FILE" ]]; then
+  source "$ENV_FILE"
+fi
+
 if [[ $# -lt 1 ]]; then
   echo "Usage: ytmv <youtube-url> [custom-name]"
   exit 1
@@ -24,7 +33,11 @@ if [[ "$clean_url" == *"youtube.com/watch"* ]]; then
   clean_url="https://www.youtube.com/watch?v=$vid"
 fi
 
-outdir="$HOME/Soulseek Downloads/complete/videos"
+if [[ -z "${YT_VIDEO_DEST:-}" ]]; then
+  echo "Error: YT_VIDEO_DEST not set. Configure it in .env"
+  exit 1
+fi
+outdir="$YT_VIDEO_DEST"
 
 # Prompt for name if not provided
 if [[ -z "$custom_name" ]]; then

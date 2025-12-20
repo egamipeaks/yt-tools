@@ -11,8 +11,9 @@ CLI utilities for downloading and tagging audio/video from YouTube.
 ## Installation
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/yt-tools.git ~/.yt-tools
+git clone https://github.com/egamipeaks/yt-tools.git ~/.yt-tools
 cd ~/.yt-tools
+cp .env.example .env  # Configure your paths
 ./install.sh
 ```
 
@@ -95,21 +96,21 @@ Options:
 
 ## Configuration
 
-### ytalbum
-
-Edit `bin/ytalbum` to change the destination directory:
+Copy `.env.example` to `.env` and set your paths:
 
 ```bash
-DEST_ROOT="/Volumes/music_ssd/Music"
+cp .env.example .env
 ```
 
-### ytmp3 / ytmv
+Required variables:
 
-Default output directories:
-- ytmp3: `~/Soulseek Downloads/complete/`
-- ytmv: `~/Soulseek Downloads/complete/videos/`
+| Variable | Description |
+|----------|-------------|
+| `YT_ALBUM_DEST` | ytalbum output directory |
+| `YT_MP3_DEST` | ytmp3 output directory |
+| `YT_VIDEO_DEST` | ytmv output directory |
 
-Edit the scripts to change these paths.
+The `.env` file is gitignored, so your local config won't be overwritten by updates.
 
 ## License
 
