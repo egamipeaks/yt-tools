@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -lt 1 ]]; then
+  echo "Usage: ytmv <youtube-url> [custom-name]"
+  exit 1
+fi
+
+url="$1"
+custom_name="${2:-}"
+
+# Prefer canonical watch URL
+clean_url="$url"
+
+# Handle youtu.be short links
+if [[ "$clean_url" =~ ^https?://(www\.)?youtu\.be/ ]]; then
+  vid="$(echo "$clean_url" | sed -E 's#^https?://(www\.)?youtu\.be/([^?&/]+).*#\2#')"
+  clean_url="https://www.youtube.com/watch?v=$vid"
+fi
+
+# Handle youtube.com/watch URLs
+if [[ "$clean_url" == *"youtube.com/watch"* ]]; then
+  vid="$(echo "$clean_url" | sed -E 's/.*[?&]v=([^&]+).*/\1/')"
+  clean_url="https://www.youtube.com/watch?v=$vid"
+fi
+
+outdir="$HOME/Soulseek Downloads/complete/videos"
+
+# Prompt for name if not provided
+if [[ -z "$custom_name" ]]; then
+  read -r -p "Video name (leave blank to use video title): " custom_name
+fi
+
+if [[ -n "$custom_name" ]]; then
+  base_name="$custom_name"
+else
+  base_name="%(title)s [%(id)s]"
+fi
+
+output_template="$outdir/$base_name/$base_name.%(ext)s"
+
+# Temp file to capture final output filepath (keeps normal yt-dlp output)
+video_path_file="$(mktemp)"
+cleanup() { rm -f "$video_path_file"; }
+trap cleanup EXIT
+
+# Download best video+audio into mp4 when possible
+# - Prefer mp4 (H.264/AAC) for wide compatibility, but fall back if needed.
+yt-dlp \
+  --no-playlist \
+  --write-thumbnail \
+  --convert-thumbnails jpg \
+  --write-description \
+  --embed-metadata \
+  --merge-output-format mp4 \
+  -f "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b" \
+  -o "$output_template" \
+  --print-to-file after_move:filepath "$video_path_file" \
+  "$clean_url"
+
+video_file="$(tail -n 1 "$video_path_file" || true)"
+
+if [[ -z "${video_file:-}" || ! -f "$video_file" ]]; then
+  echo "❌ Could not determine video output path."
+  exit 1
+fi
+
+video_dir="$(cd "$(dirname "$video_file")" && pwd)"
+
+# Rename description → .txt
+shopt -s nullglob
+for f in "$video_dir"/*.description; do
+  mv "$f" "${f%.description}.txt"
+done
+shopt -u nullglob
+
+echo
+echo "✅ Done:"
+echo "📁 $video_dir"
+echo "🎞️  $video_file"

@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  tagmp3 <path-to-mp3> [path-to-cover.jpg] [options]
+
+Options:
+  --title  "Song Title"
+  --artist "Artist Name"
+  --album  "Album Name"
+  --year   "YYYY"
+  --no-cover     Skip embedding cover art even if provided/found
+  --no-prompt    Don't prompt; error if required fields are missing
+
+Notes:
+- Uses id3v2 for tags
+- Uses ffmpeg to embed cover art (recommended, widely compatible)
+EOF
+}
+
+mp3=""
+cover=""
+title=""
+artist=""
+album=""
+year=""
+no_cover="0"
+no_prompt="0"
+
+# Positional MP3 (required)
+if [[ $# -lt 1 ]]; then
+  usage
+  exit 1
+fi
+mp3="$1"
+shift
+
+# Optional second positional (cover path) ONLY if it doesn't look like an option
+if [[ ${1:-} != "" && ${1:-} != --* ]]; then
+  cover="$1"
+  shift
+fi
+
+# Parse options
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --title)  title="${2:-}"; shift 2 ;;
+    --artist) artist="${2:-}"; shift 2 ;;
+    --album)  album="${2:-}"; shift 2 ;;
+    --year)   year="${2:-}"; shift 2 ;;
+    --no-cover)  no_cover="1"; shift ;;
+    --no-prompt) no_prompt="1"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *)
+      echo "Unknown option: $1"
+      usage
+      exit 1
+      ;;
+  esac
+done
+
+if [[ ! -f "$mp3" ]]; then
+  echo "File not found: $mp3"
+  exit 1
+fi
+
+# Prompt for anything missing (unless --no-prompt)
+if [[ "$no_prompt" == "0" ]]; then
+  [[ -n "$artist" ]] || read -r -p "Artist: " artist
+  [[ -n "$album"  ]] || read -r -p "Album:  " album
+  [[ -n "$title"  ]] || read -r -p "Title:  " title
+  [[ -n "$year"   ]] || read -r -p "Year:   " year
+fi
+
+# Title is required
+if [[ -z "${title// }" ]]; then
+  echo "❌ Title is required. Provide --title or allow prompting."
+  exit 1
+fi
+
+# Write ID3 tags (ID3v2.3 for compatibility)
+id3v2 \
+  ${artist:+--artist "$artist"} \
+  ${album:+--album "$album"} \
+  --song "$title" \
+  ${year:+--year "$year"} \
+  "$mp3"
+
+echo "✅ Tagged: $mp3"
+
+# Cover embedding (optional)
+if [[ "$no_cover" == "1" ]]; then
+  echo "ℹ️  --no-cover set; skipping cover embed."
+  exit 0
+fi
+
+# If cover not provided, try to auto-detect in same folder
+if [[ -z "$cover" ]]; then
+  dir="$(cd "$(dirname "$mp3")" && pwd)"
+  base="$(basename "$mp3" .mp3)"
+
+  for candidate in \
+    "$dir/$base.jpg" "$dir/$base.jpeg" "$dir/$base.png" \
+    "$dir/cover.jpg" "$dir/cover.jpeg" "$dir/cover.png"
+  do
+    if [[ -f "$candidate" ]]; then
+      cover="$candidate"
+      break
+    fi
+  done
+
+  if [[ -z "$cover" ]]; then
+    cover="$(find "$dir" -maxdepth 1 -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" \) | head -n 1 || true)"
+  fi
+fi
+
+if [[ -z "$cover" ]]; then
+  echo "ℹ️  No cover image found/provided; skipping embed."
+  exit 0
+fi
+
+if [[ ! -f "$cover" ]]; then
+  echo "Cover file not found: $cover"
+  exit 1
+fi
+
+if ! command -v ffmpeg >/dev/null 2>&1; then
+  echo "ffmpeg not found. Install with: brew install ffmpeg"
+  exit 1
+fi
+
+tmp="${mp3%.mp3}.tmp.mp3"
+
+ffmpeg -hide_banner -loglevel error \
+  -i "$mp3" -i "$cover" \
+  -map 0:a -map 1:v \
+  -c copy \
+  -id3v2_version 3 \
+  -metadata:s:v title="Album cover" \
+  -metadata:s:v comment="Cover (front)" \
+  "$tmp"
+
+mv -f "$tmp" "$mp3"
+echo "🖼️  Embedded cover: $cover"

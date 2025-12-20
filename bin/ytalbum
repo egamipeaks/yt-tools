@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -lt 1 ]]; then
+  echo "Usage: ytalbummp3 <youtube-url> [artist] [album] [year]"
+  exit 1
+fi
+
+url="$1"
+artist="${2:-}"
+album="${3:-}"
+year="${4:-}"
+
+# ---- Configure your destination root ----
+DEST_ROOT="/Volumes/music_ssd/Music"
+
+# ---- Extract a clean video id and force single video ----
+clean_url="$url"
+
+if [[ "$clean_url" =~ ^https?://(www\.)?youtu\.be/ ]]; then
+  vid="$(echo "$clean_url" | sed -E 's#^https?://(www\.)?youtu\.be/([^?&/]+).*#\2#')"
+  clean_url="https://www.youtube.com/watch?v=$vid"
+elif [[ "$clean_url" == *"youtube.com/watch"* ]]; then
+  vid="$(echo "$clean_url" | sed -E 's/.*[?&]v=([^&]+).*/\1/')"
+  clean_url="https://www.youtube.com/watch?v=$vid"
+fi
+
+# ---- Prompt if not provided ----
+if [[ -z "$artist" ]]; then read -r -p "Artist: " artist; fi
+if [[ -z "$album" ]]; then read -r -p "Album: " album; fi
+if [[ -z "$year" ]]; then read -r -p "Year (e.g., 1998): " year; fi
+
+# ---- Compute sort artist (strip leading "The " and use "X, The") ----
+artist_sort="$artist"
+if [[ "$artist" =~ ^The\  ]]; then
+  base="${artist#The }"
+  artist_sort="${base}, The"
+fi
+
+# ---- Local output ----
+tmpdir="$(mktemp -d)"
+trap 'rm -rf "$tmpdir"' EXIT
+
+final_name="${artist} - ${album} (Full Album).mp3"
+local_mp3="$tmpdir/$final_name"
+
+# Download best audio and convert to MP3 (best quality)
+yt-dlp \
+  --no-playlist \
+  -x --audio-format mp3 --audio-quality 0 \
+  -o "$tmpdir/%(title)s [%(id)s].%(ext)s" \
+  "$clean_url"
+
+# Find the produced mp3
+downloaded_mp3="$(find "$tmpdir" -maxdepth 1 -type f -name "*.mp3" | head -n 1)"
+if [[ -z "${downloaded_mp3:-}" ]]; then
+  echo "Error: No mp3 produced. Check yt-dlp output."
+  exit 1
+fi
+
+mv "$downloaded_mp3" "$local_mp3"
+
+# Tag the MP3 (artist/album/year/title + sort frames)
+# Title tag = "Album Name (Full Album)" (change if you prefer)
+id3v2 \
+  -a "$artist" \
+  -A "$album" \
+  -y "$year" \
+  -t "$album (Full Album)" \
+  "$local_mp3" >/dev/null
+
+# ---- Destination folder layout ----
+# Example: /Volumes/music/Music/Artist
+dest_dir="$DEST_ROOT/$artist"
+mkdir -p "$dest_dir"
+
+# Transfer
+rsync -av --progress "$local_mp3" "$dest_dir/"
+
+echo "✅ Done:"
+echo "   $dest_dir/$final_name"

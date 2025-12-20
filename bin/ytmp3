@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  echo "Usage: ytmp3 <youtube-url> [custom-filename]"
+}
+
+if [[ $# -lt 1 ]]; then
+  usage
+  exit 1
+fi
+
+url="$1"
+custom_name="${2:-}"
+
+# -----------------------
+# Canonicalize URL
+# -----------------------
+clean_url="$url"
+
+if [[ "$clean_url" =~ ^https?://(www\.)?youtu\.be/ ]]; then
+  vid="$(echo "$clean_url" | sed -E 's#^https?://(www\.)?youtu\.be/([^?&/]+).*#\2#')"
+  clean_url="https://www.youtube.com/watch?v=$vid"
+fi
+
+if [[ "$clean_url" == *"youtube.com/watch"* ]]; then
+  vid="$(echo "$clean_url" | sed -E 's/.*[?&]v=([^&]+).*/\1/')"
+  clean_url="https://www.youtube.com/watch?v=$vid"
+fi
+
+outdir="$HOME/Soulseek Downloads/complete"
+
+# -----------------------
+# Filename prompt
+# -----------------------
+if [[ -z "$custom_name" ]]; then
+  read -r -p "Track name (leave blank to use video title): " custom_name
+fi
+
+if [[ -n "$custom_name" ]]; then
+  base_name="$custom_name"
+else
+  base_name="%(title)s [%(id)s]"
+fi
+
+output_template="$outdir/$base_name/$base_name.%(ext)s"
+
+# -----------------------
+# Temp files for metadata
+# -----------------------
+mp3_path_file="$(mktemp)"
+release_year_file="$(mktemp)"
+upload_date_file="$(mktemp)"
+
+cleanup() {
+  rm -f "$mp3_path_file" "$release_year_file" "$upload_date_file"
+}
+trap cleanup EXIT
+
+# -----------------------
+# Download (show output)
+# -----------------------
+yt-dlp \
+  --no-playlist \
+  --write-thumbnail \
+  --convert-thumbnails jpg \
+  --write-description \
+  -x --audio-format mp3 --audio-quality 0 \
+  -o "$output_template" \
+  --print-to-file after_move:filepath "$mp3_path_file" \
+  --print-to-file release_year "$release_year_file" \
+  --print-to-file upload_date "$upload_date_file" \
+  "$clean_url"
+
+mp3_file="$(tail -n 1 "$mp3_path_file")"
+track_dir="$(cd "$(dirname "$mp3_file")" && pwd)"
+
+# -----------------------
+# Rename description → .txt
+# -----------------------
+shopt -s nullglob
+for f in "$track_dir"/*.description; do
+  mv "$f" "${f%.description}.txt"
+done
+shopt -u nullglob
+
+jpg_file="$(find "$track_dir" -maxdepth 1 -name "*.jpg" | head -n 1 || true)"
+
+# -----------------------
+# Derive defaults
+# -----------------------
+# Title default
+if [[ -n "$custom_name" ]]; then
+  title="$custom_name"
+else
+  title="$(basename "$mp3_file" .mp3 | sed -E 's/ \[[^]]+\]$//')"
+fi
+
+# Year default
+year=""
+ry="$(tail -n 1 "$release_year_file" | tr -d '\r' || true)"
+ud="$(tail -n 1 "$upload_date_file" | tr -d '\r' || true)"
+
+if [[ -n "${ry// }" ]]; then
+  year="$ry"
+elif [[ "$ud" =~ ^[0-9]{8}$ ]]; then
+  year="${ud:0:4}"
+fi
+
+# -----------------------
+# Prompt with defaults
+# -----------------------
+default_artist="Various Artists"
+default_album="YouTube Mixes"
+
+read -r -p "Artist [$default_artist]: " artist
+artist="${artist:-$default_artist}"
+
+read -r -p "Album  [$default_album]: " album
+album="${album:-$default_album}"
+
+read -r -p "Year   [${year:-none}]: " year_input
+year="${year_input:-$year}"
+
+# -----------------------
+# Tag & embed
+# -----------------------
+echo
+echo "🎧 Tagging:"
+echo "  Title : $title"
+echo "  Artist: $artist"
+echo "  Album : $album"
+echo "  Year  : ${year:-"(blank)"}"
+echo
+
+if [[ -n "$jpg_file" ]]; then
+  tagmp3 "$mp3_file" "$jpg_file" \
+    --title "$title" \
+    --artist "$artist" \
+    --album "$album" \
+    ${year:+--year "$year"} \
+    --no-prompt
+else
+  tagmp3 "$mp3_file" \
+    --title "$title" \
+    --artist "$artist" \
+    --album "$album" \
+    ${year:+--year "$year"} \
+    --no-prompt
+fi
+
+echo "✅ Done → $track_dir"
