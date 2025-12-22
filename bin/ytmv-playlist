@@ -1,0 +1,271 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ---- Load .env configuration ----
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || realpath "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
+ENV_FILE="$(dirname "$SCRIPT_DIR")/.env"
+
+if [[ -f "$ENV_FILE" ]]; then
+  source "$ENV_FILE"
+fi
+
+# ---- Usage ----
+if [[ $# -lt 1 ]]; then
+  echo "Usage: ytmv-playlist <playlist-url>"
+  echo
+  echo "Downloads each video in a YouTube playlist, auto-detecting"
+  echo "artist and track names with confirmation prompts."
+  exit 1
+fi
+
+playlist_url="$1"
+
+# ---- Dependency checks ----
+check_dependency() {
+  if ! command -v "$1" &>/dev/null; then
+    echo "Error: $1 is not installed."
+    echo "$2"
+    exit 1
+  fi
+}
+
+check_dependency yt-dlp "Install with: brew install yt-dlp"
+check_dependency jq "Install with: brew install jq"
+
+# fpcalc is optional (for fingerprinting)
+HAS_FPCALC=false
+if command -v fpcalc &>/dev/null; then
+  HAS_FPCALC=true
+fi
+
+# AcoustID API key (optional, for fingerprinting)
+ACOUSTID_API_KEY="${ACOUSTID_API_KEY:-}"
+
+# ---- Helper functions ----
+
+# Try to detect "Artist - Track" from a string
+parse_artist_track() {
+  local input="$1"
+
+  # Common separators: " - ", " – ", " — ", " | "
+  # Also handle "(Official Video)" and similar suffixes
+  local cleaned
+  cleaned="$(echo "$input" | sed -E 's/\s*\((Official|Music|Lyric|Audio|Video|Visualizer|HD|HQ|4K|Lyrics?).*\)//gi')"
+  cleaned="$(echo "$cleaned" | sed -E 's/\s*\[(Official|Music|Lyric|Audio|Video|Visualizer|HD|HQ|4K|Lyrics?).*\]//gi')"
+  cleaned="$(echo "$cleaned" | sed -E 's/\s*(Official|Music|Lyric|Audio|Video|Visualizer)\s*(Video|Audio)?$//gi')"
+  cleaned="$(echo "$cleaned" | sed -E 's/\s*$//; s/^\s*//')"
+
+  # Try different separators
+  if [[ "$cleaned" =~ ^(.+)[[:space:]][-–—][[:space:]](.+)$ ]]; then
+    local artist="${BASH_REMATCH[1]}"
+    local track="${BASH_REMATCH[2]}"
+    # Trim whitespace
+    artist="$(echo "$artist" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    track="$(echo "$track" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    echo "$artist - $track"
+    return 0
+  fi
+
+  return 1
+}
+
+# Query AcoustID for fingerprint match
+lookup_acoustid() {
+  local fingerprint="$1"
+  local duration="$2"
+
+  if [[ -z "$ACOUSTID_API_KEY" ]]; then
+    return 1
+  fi
+
+  local response
+  response="$(curl -s "https://api.acoustid.org/v2/lookup" \
+    -d "client=$ACOUSTID_API_KEY" \
+    -d "fingerprint=$fingerprint" \
+    -d "duration=$duration" \
+    -d "meta=recordings+releasegroups+compress")" || return 1
+
+  # Parse response for best match
+  local artist track
+  artist="$(echo "$response" | jq -r '.results[0].recordings[0].artists[0].name // empty' 2>/dev/null)" || true
+  track="$(echo "$response" | jq -r '.results[0].recordings[0].title // empty' 2>/dev/null)" || true
+
+  if [[ -n "$artist" && -n "$track" ]]; then
+    echo "$artist - $track"
+    return 0
+  fi
+
+  return 1
+}
+
+# Fingerprint audio and lookup
+fingerprint_and_lookup() {
+  local video_url="$1"
+
+  if [[ "$HAS_FPCALC" != "true" || -z "$ACOUSTID_API_KEY" ]]; then
+    return 1
+  fi
+
+  echo "  🔊 Fingerprinting audio..." >&2
+
+  # Create temp file for audio sample
+  local tmp_audio
+  tmp_audio="$(mktemp -d)/sample.mp3"
+
+  # Download just 45 seconds of audio (enough for fingerprinting)
+  if ! yt-dlp -q --no-warnings --no-playlist \
+    -x --audio-format mp3 \
+    --download-sections "*0:00-0:45" \
+    -o "$tmp_audio" \
+    "$video_url" 2>/dev/null; then
+    rm -rf "$(dirname "$tmp_audio")"
+    return 1
+  fi
+
+  # Generate fingerprint
+  local fpcalc_output
+  if ! fpcalc_output="$(fpcalc -json "$tmp_audio" 2>/dev/null)"; then
+    rm -rf "$(dirname "$tmp_audio")"
+    return 1
+  fi
+
+  rm -rf "$(dirname "$tmp_audio")"
+
+  local fingerprint duration
+  fingerprint="$(echo "$fpcalc_output" | jq -r '.fingerprint // empty')"
+  duration="$(echo "$fpcalc_output" | jq -r '.duration // empty' | cut -d. -f1)"
+
+  if [[ -z "$fingerprint" || -z "$duration" ]]; then
+    return 1
+  fi
+
+  lookup_acoustid "$fingerprint" "$duration"
+}
+
+# Detect title using all available methods
+detect_title() {
+  local video_url="$1"
+  local yt_title="$2"
+  local yt_artist="$3"
+  local yt_track="$4"
+
+  # Method 1: YouTube metadata (artist + track)
+  if [[ -n "$yt_artist" && -n "$yt_track" && "$yt_artist" != "NA" && "$yt_track" != "NA" ]]; then
+    echo "yt_meta|$yt_artist - $yt_track"
+    return 0
+  fi
+
+  # Method 2: Parse video title
+  local parsed
+  if parsed="$(parse_artist_track "$yt_title")"; then
+    echo "title_parse|$parsed"
+    return 0
+  fi
+
+  # Method 3: Audio fingerprinting
+  local fingerprint_result
+  if fingerprint_result="$(fingerprint_and_lookup "$video_url")"; then
+    echo "fingerprint|$fingerprint_result"
+    return 0
+  fi
+
+  # Fallback: use original title
+  echo "fallback|$yt_title"
+  return 0
+}
+
+# ---- Main ----
+
+echo "🎵 Fetching playlist info..."
+playlist_json="$(yt-dlp --flat-playlist -J "$playlist_url" 2>/dev/null)"
+
+playlist_title="$(echo "$playlist_json" | jq -r '.title // "Unknown Playlist"')"
+video_count="$(echo "$playlist_json" | jq '.entries | length')"
+
+echo "📋 Playlist: $playlist_title"
+echo "📊 Videos: $video_count"
+echo
+
+if [[ "$video_count" -eq 0 ]]; then
+  echo "No videos found in playlist."
+  exit 1
+fi
+
+# Process each video
+current=0
+echo "$playlist_json" | jq -c '.entries[]' | while read -r entry; do
+  current=$((current + 1))
+
+  video_id="$(echo "$entry" | jq -r '.id')"
+  video_url="https://www.youtube.com/watch?v=$video_id"
+  raw_title="$(echo "$entry" | jq -r '.title // "Unknown"')"
+
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "[$current/$video_count] $raw_title"
+  echo "  🔗 $video_url"
+
+  # Get additional metadata
+  echo "  📡 Fetching metadata..."
+  video_meta="$(yt-dlp --no-playlist -J "$video_url" 2>/dev/null)" || video_meta="{}"
+
+  yt_artist="$(echo "$video_meta" | jq -r '.artist // "NA"')"
+  yt_track="$(echo "$video_meta" | jq -r '.track // "NA"')"
+  full_title="$(echo "$video_meta" | jq -r --arg fallback "$raw_title" '.title // $fallback')"
+
+  # Detect best title
+  detection="$(detect_title "$video_url" "$full_title" "$yt_artist" "$yt_track")"
+  method="${detection%%|*}"
+  suggested_title="${detection#*|}"
+
+  case "$method" in
+    yt_meta)     method_label="YouTube metadata" ;;
+    title_parse) method_label="Title parsing" ;;
+    fingerprint) method_label="Audio fingerprint" ;;
+    fallback)    method_label="Original title" ;;
+    *)           method_label="Unknown" ;;
+  esac
+
+  echo
+  echo "  ✨ Detected ($method_label):"
+  echo "     $suggested_title"
+  echo
+
+  # Prompt for confirmation (read from terminal, not pipe)
+  read -r -p "  [Enter=OK, e=edit, s=skip] " response </dev/tty
+  response_lower="$(echo "$response" | tr '[:upper:]' '[:lower:]')"
+
+  case "$response_lower" in
+    "")
+      final_title="$suggested_title"
+      ;;
+    e|edit)
+      read -r -p "  Enter title (Artist - Track): " final_title </dev/tty
+      if [[ -z "$final_title" ]]; then
+        echo "  ⏭️  Skipping (no title provided)"
+        continue
+      fi
+      ;;
+    s|skip)
+      echo "  ⏭️  Skipping"
+      continue
+      ;;
+    *)
+      # Treat as custom title input
+      final_title="$response"
+      ;;
+  esac
+
+  echo "  📥 Downloading as: $final_title"
+  echo
+
+  # Call ytmv with the title
+  "$SCRIPT_DIR/ytmv" "$video_url" "$final_title" || {
+    echo "  ⚠️  Download failed, continuing..."
+  }
+
+  echo
+done
+
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "✅ Playlist complete!"
