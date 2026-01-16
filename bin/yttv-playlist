@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ---- Load .env configuration ----
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || realpath "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
+ENV_FILE="$(dirname "$SCRIPT_DIR")/.env"
+
+if [[ -f "$ENV_FILE" ]]; then
+  source "$ENV_FILE"
+fi
+
+# ---- Usage ----
+if [[ $# -lt 2 ]]; then
+  echo "Usage: yttv-playlist <playlist-url> <show-name>"
+  echo
+  echo "Downloads a YouTube playlist as TV episodes with proper naming."
+  echo "For each video, auto-detects season/episode and prompts for confirmation."
+  echo
+  echo "Output format:"
+  echo "  {show-name}/Season {XX}/{show-name} - s{XX}e{XX}.mp4"
+  echo
+  echo "Example:"
+  echo "  yttv-playlist 'https://youtube.com/playlist?list=...' 'Breaking Bad'"
+  exit 1
+fi
+
+playlist_url="$1"
+show_name="$2"
+
+# ---- Dependency checks ----
+check_dependency() {
+  if ! command -v "$1" &>/dev/null; then
+    echo "Error: $1 is not installed."
+    echo "$2"
+    exit 1
+  fi
+}
+
+check_dependency yt-dlp "Install with: brew install yt-dlp"
+check_dependency jq "Install with: brew install jq"
+
+# ---- Output directory ----
+if [[ -z "${YT_TV_DEST:-}" ]]; then
+  echo "Error: YT_TV_DEST not set. Configure it in .env"
+  exit 1
+fi
+
+outdir="$YT_TV_DEST"
+
+# ---- Helper functions ----
+
+# Try to detect season and episode from title
+# Common patterns: S01E01, s1e1, Season 1 Episode 1, 1x01, etc.
+parse_season_episode() {
+  local input="$1"
+
+  # Pattern: S01E01 or s1e1
+  if [[ "$input" =~ [Ss]([0-9]+)[Ee]([0-9]+) ]]; then
+    echo "${BASH_REMATCH[1]}|${BASH_REMATCH[2]}"
+    return 0
+  fi
+
+  # Pattern: 1x01 or 01x01
+  if [[ "$input" =~ ([0-9]+)[xX]([0-9]+) ]]; then
+    echo "${BASH_REMATCH[1]}|${BASH_REMATCH[2]}"
+    return 0
+  fi
+
+  # Pattern: Season 1 Episode 1
+  if [[ "$input" =~ [Ss]eason[[:space:]]*([0-9]+)[[:space:]]*[Ee]pisode[[:space:]]*([0-9]+) ]]; then
+    echo "${BASH_REMATCH[1]}|${BASH_REMATCH[2]}"
+    return 0
+  fi
+
+  # Pattern: Ep 1, Episode 1 (assume season 1)
+  if [[ "$input" =~ [Ee]p(isode)?[[:space:]]*([0-9]+) ]]; then
+    echo "1|${BASH_REMATCH[2]}"
+    return 0
+  fi
+
+  # Pattern: standalone number at start like "01 - Title" or "1. Title"
+  if [[ "$input" =~ ^([0-9]+)[[:space:]]*[-.\)][[:space:]] ]]; then
+    echo "1|${BASH_REMATCH[1]}"
+    return 0
+  fi
+
+  return 1
+}
+
+# Track last used season for smarter defaults
+last_season=""
+last_episode=""
+
+# ---- Main ----
+
+echo "Fetching playlist info..."
+playlist_json="$(yt-dlp --flat-playlist -J "$playlist_url" 2>/dev/null)"
+
+playlist_title="$(echo "$playlist_json" | jq -r '.title // "Unknown Playlist"')"
+video_count="$(echo "$playlist_json" | jq '.entries | length')"
+
+echo "Playlist: $playlist_title"
+echo "Videos: $video_count"
+echo "Show: $show_name"
+echo "Output: $outdir/$show_name/"
+echo
+
+if [[ "$video_count" -eq 0 ]]; then
+  echo "No videos found in playlist."
+  exit 1
+fi
+
+# Process each video
+index=0
+echo "$playlist_json" | jq -c '.entries[]' | while read -r entry; do
+  index=$((index + 1))
+
+  video_id="$(echo "$entry" | jq -r '.id')"
+  video_url="https://www.youtube.com/watch?v=$video_id"
+  raw_title="$(echo "$entry" | jq -r '.title // "Unknown"')"
+
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "[$index/$video_count] $raw_title"
+  echo "  $video_url"
+
+  # Try to detect season/episode
+  detected_season=""
+  detected_episode=""
+  detection_method=""
+
+  if parsed="$(parse_season_episode "$raw_title")"; then
+    detected_season="${parsed%%|*}"
+    detected_episode="${parsed#*|}"
+    detection_method="title"
+  fi
+
+  # If no detection, use last values as suggestion (increment episode)
+  if [[ -z "$detected_season" ]]; then
+    if [[ -n "$last_season" ]]; then
+      detected_season="$last_season"
+      detected_episode=$((last_episode + 1))
+      detection_method="sequential"
+    fi
+  fi
+
+  # Display detected values
+  echo
+  if [[ -n "$detected_season" ]]; then
+    echo "  Detected ($detection_method):"
+    echo "     Season:  $detected_season"
+    echo "     Episode: $detected_episode"
+  else
+    echo "  Could not detect season/episode"
+  fi
+  echo
+
+  # Prompt for confirmation
+  read -r -p "  [Enter=OK, e=edit, s=skip] " response </dev/tty
+  response_lower="$(echo "$response" | tr '[:upper:]' '[:lower:]')"
+
+  final_season="$detected_season"
+  final_episode="$detected_episode"
+
+  case "$response_lower" in
+    "")
+      # Use detected values, but prompt if missing
+      if [[ -z "$final_season" ]]; then
+        read -r -p "  Season: " final_season </dev/tty
+      fi
+      if [[ -z "$final_episode" ]]; then
+        read -r -p "  Episode: " final_episode </dev/tty
+      fi
+      ;;
+    e|edit)
+      read -r -p "  Season [${detected_season:-1}]: " input_season </dev/tty
+      final_season="${input_season:-${detected_season:-1}}"
+
+      read -r -p "  Episode [${detected_episode:-1}]: " input_episode </dev/tty
+      final_episode="${input_episode:-${detected_episode:-1}}"
+      ;;
+    s|skip)
+      echo "  Skipping"
+      continue
+      ;;
+    *)
+      echo "  Skipping"
+      continue
+      ;;
+  esac
+
+  if [[ -z "$final_season" || -z "$final_episode" ]]; then
+    echo "  Skipping (missing season or episode)"
+    continue
+  fi
+
+  # Update last values for next iteration
+  last_season="$final_season"
+  last_episode="$final_episode"
+
+  # Zero-pad season and episode
+  season_padded="$(printf '%02d' "$final_season")"
+  episode_padded="$(printf '%02d' "$final_episode")"
+
+  # Build paths
+  season_dir="$outdir/$show_name/Season $season_padded"
+  episode_name="$show_name - s${season_padded}e${episode_padded}"
+  output_file="$season_dir/$episode_name.mp4"
+
+  mkdir -p "$season_dir"
+
+  echo "  Downloading: $episode_name"
+
+  # Skip if file already exists
+  if [[ -f "$output_file" ]]; then
+    echo "  Already exists, skipping download..."
+    continue
+  fi
+
+  # Download best video+audio up to 1080p, merge into mp4
+  if yt-dlp \
+    --no-playlist \
+    --embed-metadata \
+    --replace-in-metadata "title" "^.+$" "$episode_name" \
+    --merge-output-format mp4 \
+    -f "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/bv*[height<=1080]+ba/b[height<=1080]" \
+    -o "$output_file" \
+    "$video_url"; then
+    echo "  Done: $episode_name"
+  else
+    echo "  Download failed, continuing..."
+  fi
+
+  echo
+done
+
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "Complete!"
+echo "Files saved to: $outdir/$show_name/"

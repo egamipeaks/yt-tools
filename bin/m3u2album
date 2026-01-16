@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ---- Load .env configuration ----
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || realpath "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
+ENV_FILE="$(dirname "$SCRIPT_DIR")/.env"
+
+if [[ -f "$ENV_FILE" ]]; then
+  source "$ENV_FILE"
+fi
+
+usage() {
+  cat <<'EOF'
+Usage:
+  m3u2album <playlist.m3u> <playlist-title>
+
+Creates an album from an m3u playlist by:
+  - Copying MP3 files to the configured output directory
+  - Numbering tracks according to playlist order
+  - Tagging with: Album Artist = "Various Artists"
+                  Album = playlist title
+                  Year = current year
+                  Track = position in playlist
+
+Configuration:
+  Set M3U_ALBUM_DEST in .env to specify output directory
+EOF
+}
+
+if [[ $# -lt 2 ]]; then
+  usage
+  exit 1
+fi
+
+m3u_file="$1"
+playlist_title="$2"
+
+if [[ ! -f "$m3u_file" ]]; then
+  echo "Error: Playlist file not found: $m3u_file"
+  exit 1
+fi
+
+if [[ -z "${M3U_ALBUM_DEST:-}" ]]; then
+  echo "Error: M3U_ALBUM_DEST not set. Configure it in .env"
+  exit 1
+fi
+
+if ! command -v ffmpeg >/dev/null 2>&1; then
+  echo "Error: ffmpeg not found. Install with: brew install ffmpeg"
+  exit 1
+fi
+
+# Create output directory
+output_dir="$M3U_ALBUM_DEST/$playlist_title"
+mkdir -p "$output_dir"
+
+current_year="$(date +%Y)"
+
+# Prompt for album artist
+default_album_artist="Various Artists"
+read -r -p "Album Artist [$default_album_artist]: " album_artist
+album_artist="${album_artist:-$default_album_artist}"
+
+# Parse m3u file - handle both standard (newline-separated) and concatenated formats
+# Extract all absolute paths (starting with /)
+tracks_file="$(mktemp)"
+grep -oE '/[^#]+\.mp3' "$m3u_file" > "$tracks_file" || true
+
+total_tracks="$(wc -l < "$tracks_file" | tr -d ' ')"
+
+if [[ $total_tracks -eq 0 ]]; then
+  rm -f "$tracks_file"
+  echo "Error: No MP3 tracks found in playlist"
+  exit 1
+fi
+
+echo "Processing $total_tracks tracks from: $m3u_file"
+echo "Output directory: $output_dir"
+echo "Album: $playlist_title"
+echo "Album Artist: $album_artist"
+echo "Year: $current_year"
+echo
+
+track_num=0
+
+# Process each track
+while IFS= read -r src_file; do
+  [[ -z "$src_file" ]] && continue
+  ((track_num++))
+
+  if [[ ! -f "$src_file" ]]; then
+    echo "Warning: File not found, skipping: $src_file"
+    continue
+  fi
+
+  # Get original filename as fallback
+  original_name="$(basename "$src_file" .mp3)"
+
+  # Extract metadata from source file
+  src_artist="$(ffprobe -v quiet -show_entries format_tags=artist -of default=noprint_wrappers=1:nokey=1 "$src_file" 2>/dev/null || true)"
+  src_title="$(ffprobe -v quiet -show_entries format_tags=title -of default=noprint_wrappers=1:nokey=1 "$src_file" 2>/dev/null || true)"
+
+  # Use metadata if available, otherwise fall back to filename
+  artist="${src_artist:-Unknown Artist}"
+  title="${src_title:-$original_name}"
+
+  # Create numbered filename (zero-padded based on total tracks)
+  if [[ $total_tracks -ge 100 ]]; then
+    padded_num="$(printf "%03d" "$track_num")"
+  else
+    padded_num="$(printf "%02d" "$track_num")"
+  fi
+
+  # Sanitize artist and title for filename (remove problematic characters)
+  safe_artist="$(echo "$artist" | tr '/:' '-' | sed 's/[<>"|?*]//g')"
+  safe_title="$(echo "$title" | tr '/:' '-' | sed 's/[<>"|?*]//g')"
+
+  dest_file="$output_dir/${padded_num} - ${safe_artist} - ${safe_title}.mp3"
+
+  echo "[$track_num/$total_tracks] $safe_artist - $safe_title"
+
+  # Copy file and tag with ffmpeg (preserves UTF-8 metadata properly)
+  ffmpeg -y -i "$src_file" \
+    -c copy \
+    -id3v2_version 3 \
+    -metadata artist="$artist" \
+    -metadata album="$playlist_title" \
+    -metadata date="$current_year" \
+    -metadata track="$track_num/$total_tracks" \
+    -metadata title="$title" \
+    -metadata album_artist="$album_artist" \
+    "$dest_file" 2>/dev/null
+
+done < "$tracks_file"
+
+rm -f "$tracks_file"
+
+echo
+echo "Done! Created album at: $output_dir"
+echo "  Tracks:       $track_num"
+echo "  Album:        $playlist_title"
+echo "  Album Artist: $album_artist"
+echo "  Year:         $current_year"

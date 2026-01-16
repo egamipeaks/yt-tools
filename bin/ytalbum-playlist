@@ -1,0 +1,222 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ---- Load .env configuration ----
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || realpath "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
+ENV_FILE="$(dirname "$SCRIPT_DIR")/.env"
+
+if [[ -f "$ENV_FILE" ]]; then
+  source "$ENV_FILE"
+fi
+
+# ---- Usage ----
+if [[ $# -lt 1 ]]; then
+  echo "Usage: ytalbum-playlist <playlist-url>"
+  echo
+  echo "Downloads each video in a YouTube playlist as a full album MP3,"
+  echo "auto-detecting artist, album, and year with confirmation prompts."
+  exit 1
+fi
+
+playlist_url="$1"
+
+# ---- Dependency checks ----
+check_dependency() {
+  if ! command -v "$1" &>/dev/null; then
+    echo "Error: $1 is not installed."
+    echo "$2"
+    exit 1
+  fi
+}
+
+check_dependency yt-dlp "Install with: brew install yt-dlp"
+check_dependency jq "Install with: brew install jq"
+
+# ---- Helper functions ----
+
+# Parse "Artist - Album" from video title, stripping common suffixes
+parse_artist_album() {
+  local input="$1"
+
+  # Remove common suffixes: (Full Album), [Full Album], (YEAR), etc.
+  local cleaned
+  cleaned="$(echo "$input" | sed -E 's/\s*\((Full Album|Complete Album|Remastered|Remaster|Deluxe|Edition)\)//gi')"
+  cleaned="$(echo "$cleaned" | sed -E 's/\s*\[(Full Album|Complete Album|Remastered|Remaster|Deluxe|Edition)\]//gi')"
+  cleaned="$(echo "$cleaned" | sed -E 's/\s*\([0-9]{4}\)//g')"
+  cleaned="$(echo "$cleaned" | sed -E 's/\s*\[[0-9]{4}\]//g')"
+  cleaned="$(echo "$cleaned" | sed -E 's/\s*(Full Album|Complete Album)\s*$//gi')"
+  cleaned="$(echo "$cleaned" | sed -E 's/\s*$//; s/^\s*//')"
+
+  # Try different separators: " - ", " – ", " — "
+  if [[ "$cleaned" =~ ^(.+)[[:space:]][-–—][[:space:]](.+)$ ]]; then
+    local artist="${BASH_REMATCH[1]}"
+    local album="${BASH_REMATCH[2]}"
+    # Trim whitespace
+    artist="$(echo "$artist" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    album="$(echo "$album" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    echo "$artist|$album"
+    return 0
+  fi
+
+  return 1
+}
+
+# Extract year from title
+extract_year_from_title() {
+  local input="$1"
+
+  # Look for (YYYY) or [YYYY] patterns
+  if [[ "$input" =~ \(([0-9]{4})\) ]]; then
+    echo "${BASH_REMATCH[1]}"
+    return 0
+  fi
+
+  if [[ "$input" =~ \[([0-9]{4})\] ]]; then
+    echo "${BASH_REMATCH[1]}"
+    return 0
+  fi
+
+  return 1
+}
+
+# ---- Main ----
+
+echo "Fetching playlist info..."
+playlist_json="$(yt-dlp --flat-playlist -J "$playlist_url" 2>/dev/null)"
+
+playlist_title="$(echo "$playlist_json" | jq -r '.title // "Unknown Playlist"')"
+video_count="$(echo "$playlist_json" | jq '.entries | length')"
+
+echo "Playlist: $playlist_title"
+echo "Videos: $video_count"
+echo
+
+if [[ "$video_count" -eq 0 ]]; then
+  echo "No videos found in playlist."
+  exit 1
+fi
+
+# Process each video
+current=0
+echo "$playlist_json" | jq -c '.entries[]' | while read -r entry; do
+  current=$((current + 1))
+
+  video_id="$(echo "$entry" | jq -r '.id')"
+  video_url="https://www.youtube.com/watch?v=$video_id"
+  raw_title="$(echo "$entry" | jq -r '.title // "Unknown"')"
+
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "[$current/$video_count] $raw_title"
+  echo "  $video_url"
+
+  # Get additional metadata
+  echo "  Fetching metadata..."
+  video_meta="$(yt-dlp --no-playlist -J "$video_url" 2>/dev/null)" || video_meta="{}"
+
+  yt_artist="$(echo "$video_meta" | jq -r '.artist // empty')"
+  yt_album="$(echo "$video_meta" | jq -r '.album // empty')"
+  yt_release_year="$(echo "$video_meta" | jq -r '.release_year // empty')"
+  upload_date="$(echo "$video_meta" | jq -r '.upload_date // empty')"
+  full_title="$(echo "$video_meta" | jq -r --arg fallback "$raw_title" '.title // $fallback')"
+
+  # Detect artist and album
+  detected_artist=""
+  detected_album=""
+  detection_method=""
+
+  # Method 1: YouTube metadata
+  if [[ -n "$yt_artist" && -n "$yt_album" ]]; then
+    detected_artist="$yt_artist"
+    detected_album="$yt_album"
+    detection_method="YouTube metadata"
+  # Method 2: Parse from title
+  elif parsed="$(parse_artist_album "$full_title")"; then
+    detected_artist="${parsed%%|*}"
+    detected_album="${parsed#*|}"
+    detection_method="Title parsing"
+  else
+    # Fallback: use title as album, prompt for artist
+    detected_album="$full_title"
+    detection_method="Fallback (title as album)"
+  fi
+
+  # Detect year
+  detected_year=""
+  year_method=""
+
+  if [[ -n "$yt_release_year" ]]; then
+    detected_year="$yt_release_year"
+    year_method="metadata"
+  elif title_year="$(extract_year_from_title "$full_title")"; then
+    detected_year="$title_year"
+    year_method="title"
+  elif [[ "$upload_date" =~ ^[0-9]{8}$ ]]; then
+    detected_year="${upload_date:0:4}"
+    year_method="upload date"
+  fi
+
+  echo
+  echo "  Detected ($detection_method):"
+  echo "     Artist: ${detected_artist:-"(not detected)"}"
+  echo "     Album:  ${detected_album:-"(not detected)"}"
+  echo "     Year:   ${detected_year:-"(not detected)"}${year_method:+ ($year_method)}"
+  echo
+
+  # Prompt for confirmation
+  read -r -p "  [Enter=OK, e=edit, s=skip] " response </dev/tty
+  response_lower="$(echo "$response" | tr '[:upper:]' '[:lower:]')"
+
+  final_artist="$detected_artist"
+  final_album="$detected_album"
+  final_year="$detected_year"
+
+  case "$response_lower" in
+    "")
+      # Use detected values
+      if [[ -z "$final_artist" ]]; then
+        read -r -p "  Artist: " final_artist </dev/tty
+      fi
+      if [[ -z "$final_album" ]]; then
+        read -r -p "  Album: " final_album </dev/tty
+      fi
+      ;;
+    e|edit)
+      read -r -p "  Artist [${detected_artist:-}]: " input_artist </dev/tty
+      final_artist="${input_artist:-$detected_artist}"
+
+      read -r -p "  Album [${detected_album:-}]: " input_album </dev/tty
+      final_album="${input_album:-$detected_album}"
+
+      read -r -p "  Year [${detected_year:-}]: " input_year </dev/tty
+      final_year="${input_year:-$detected_year}"
+      ;;
+    s|skip)
+      echo "  Skipping"
+      continue
+      ;;
+    *)
+      # Treat as skip
+      echo "  Skipping"
+      continue
+      ;;
+  esac
+
+  if [[ -z "$final_artist" || -z "$final_album" ]]; then
+    echo "  Skipping (missing artist or album)"
+    continue
+  fi
+
+  echo "  Downloading: $final_artist - $final_album (Full Album)"
+  echo
+
+  # Call ytalbum with the detected/edited values
+  "$SCRIPT_DIR/ytalbum" "$video_url" "$final_artist" "$final_album" "$final_year" || {
+    echo "  Download failed, continuing..."
+  }
+
+  echo
+done
+
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "Playlist complete!"
