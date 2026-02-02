@@ -33,6 +33,12 @@ check_dependency() {
 check_dependency yt-dlp "Install with: brew install yt-dlp"
 check_dependency jq "Install with: brew install jq"
 
+# Build cookie args if browser specified
+cookie_args=()
+if [[ -n "${YT_COOKIES_BROWSER:-}" ]]; then
+  cookie_args=(--cookies-from-browser "$YT_COOKIES_BROWSER")
+fi
+
 # ---- Helper functions ----
 
 # Parse "Artist - Album" from video title, stripping common suffixes
@@ -83,7 +89,7 @@ extract_year_from_title() {
 # ---- Main ----
 
 echo "Fetching playlist info..."
-playlist_json="$(yt-dlp --flat-playlist -J "$playlist_url" 2>/dev/null)"
+playlist_json="$(yt-dlp "${cookie_args[@]}" --flat-playlist -J "$playlist_url" 2>/dev/null)"
 
 playlist_title="$(echo "$playlist_json" | jq -r '.title // "Unknown Playlist"')"
 video_count="$(echo "$playlist_json" | jq '.entries | length')"
@@ -112,7 +118,7 @@ echo "$playlist_json" | jq -c '.entries[]' | while read -r entry; do
 
   # Get additional metadata
   echo "  Fetching metadata..."
-  video_meta="$(yt-dlp --no-playlist -J "$video_url" 2>/dev/null)" || video_meta="{}"
+  video_meta="$(yt-dlp "${cookie_args[@]}" --no-playlist -J "$video_url" 2>/dev/null)" || video_meta="{}"
 
   yt_artist="$(echo "$video_meta" | jq -r '.artist // empty')"
   yt_album="$(echo "$video_meta" | jq -r '.album // empty')"

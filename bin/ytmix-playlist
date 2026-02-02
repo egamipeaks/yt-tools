@@ -42,6 +42,12 @@ if [[ -z "${YT_MIX_DEST:-}" ]]; then
 fi
 DEST_ROOT="$YT_MIX_DEST"
 
+# Build cookie args if browser specified
+cookie_args=()
+if [[ -n "${YT_COOKIES_BROWSER:-}" ]]; then
+  cookie_args=(--cookies-from-browser "$YT_COOKIES_BROWSER")
+fi
+
 # ---- Helper functions ----
 
 # Parse "Artist - Title" from video title, stripping common suffixes
@@ -81,7 +87,7 @@ sanitize_filename() {
 # ---- Main ----
 
 echo "Fetching playlist info..."
-playlist_json="$(yt-dlp --flat-playlist -J "$playlist_url" 2>/dev/null)"
+playlist_json="$(yt-dlp "${cookie_args[@]}" --flat-playlist -J "$playlist_url" 2>/dev/null)"
 
 playlist_title="$(echo "$playlist_json" | jq -r '.title // "Unknown Playlist"')"
 video_count="$(echo "$playlist_json" | jq '.entries | length')"
@@ -191,6 +197,7 @@ echo "$playlist_json" | jq -c '.entries[]' | while read -r entry; do
 
   # Download to temp directory
   yt-dlp \
+    "${cookie_args[@]}" \
     --no-playlist \
     -x --audio-format mp3 --audio-quality 0 \
     -o "$tmpdir/%(id)s.%(ext)s" \

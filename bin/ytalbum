@@ -57,8 +57,15 @@ trap 'rm -rf "$tmpdir"' EXIT
 final_name="${artist} - ${album} (Full Album).mp3"
 local_mp3="$tmpdir/$final_name"
 
+# Build cookie args if browser specified
+cookie_args=()
+if [[ -n "${YT_COOKIES_BROWSER:-}" ]]; then
+  cookie_args=(--cookies-from-browser "$YT_COOKIES_BROWSER")
+fi
+
 # Download best audio and convert to MP3 (best quality)
 yt-dlp \
+  "${cookie_args[@]}" \
   --no-playlist \
   -x --audio-format mp3 --audio-quality 0 \
   -o "$tmpdir/%(title)s [%(id)s].%(ext)s" \

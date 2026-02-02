@@ -42,6 +42,12 @@ fi
 # AcoustID API key (optional, for fingerprinting)
 ACOUSTID_API_KEY="${ACOUSTID_API_KEY:-}"
 
+# Build cookie args if browser specified
+cookie_args=()
+if [[ -n "${YT_COOKIES_BROWSER:-}" ]]; then
+  cookie_args=(--cookies-from-browser "$YT_COOKIES_BROWSER")
+fi
+
 # ---- Helper functions ----
 
 # Try to detect "Artist - Track" from a string
@@ -114,7 +120,7 @@ fingerprint_and_lookup() {
   tmp_audio="$(mktemp -d)/sample.mp3"
 
   # Download just 45 seconds of audio (enough for fingerprinting)
-  if ! yt-dlp -q --no-warnings --no-playlist \
+  if ! yt-dlp "${cookie_args[@]}" -q --no-warnings --no-playlist \
     -x --audio-format mp3 \
     --download-sections "*0:00-0:45" \
     -o "$tmp_audio" \
@@ -178,7 +184,7 @@ detect_title() {
 # ---- Main ----
 
 echo "🎵 Fetching playlist info..."
-playlist_json="$(yt-dlp --flat-playlist -J "$playlist_url" 2>/dev/null)"
+playlist_json="$(yt-dlp "${cookie_args[@]}" --flat-playlist -J "$playlist_url" 2>/dev/null)"
 
 playlist_title="$(echo "$playlist_json" | jq -r '.title // "Unknown Playlist"')"
 video_count="$(echo "$playlist_json" | jq '.entries | length')"
@@ -207,7 +213,7 @@ echo "$playlist_json" | jq -c '.entries[]' | while read -r entry; do
 
   # Get additional metadata
   echo "  📡 Fetching metadata..."
-  video_meta="$(yt-dlp --no-playlist -J "$video_url" 2>/dev/null)" || video_meta="{}"
+  video_meta="$(yt-dlp "${cookie_args[@]}" --no-playlist -J "$video_url" 2>/dev/null)" || video_meta="{}"
 
   yt_artist="$(echo "$video_meta" | jq -r '.artist // "NA"')"
   yt_track="$(echo "$video_meta" | jq -r '.track // "NA"')"
