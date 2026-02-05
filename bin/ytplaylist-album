@@ -1,0 +1,289 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ---- Load .env configuration ----
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || realpath "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
+ENV_FILE="$(dirname "$SCRIPT_DIR")/.env"
+
+if [[ -f "$ENV_FILE" ]]; then
+  source "$ENV_FILE"
+fi
+
+# ---- Usage ----
+show_usage() {
+  echo "Usage: ytplaylist-album [options] <playlist-url>"
+  echo
+  echo "Downloads a YouTube playlist as a single-artist album."
+  echo "All songs are tagged with the same artist/album (useful for band playlists"
+  echo "or curated compilations where you want one artist attribution)."
+  echo
+  echo "Options:"
+  echo "  -y, --yes    Skip title confirmations (auto-accept detected titles)"
+  exit 1
+}
+
+# Parse options
+auto_confirm=false
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -y|--yes)
+      auto_confirm=true
+      shift
+      ;;
+    -h|--help)
+      show_usage
+      ;;
+    -*)
+      echo "Unknown option: $1"
+      show_usage
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+if [[ $# -lt 1 ]]; then
+  show_usage
+fi
+
+playlist_url="$1"
+
+# ---- Dependency checks ----
+check_dependency() {
+  if ! command -v "$1" &>/dev/null; then
+    echo "Error: $1 is not installed."
+    echo "$2"
+    exit 1
+  fi
+}
+
+check_dependency yt-dlp "Install with: brew install yt-dlp"
+check_dependency jq "Install with: brew install jq"
+check_dependency id3v2 "Install with: brew install id3v2"
+
+# ---- Configuration ----
+if [[ -z "${YT_ALBUM_DEST:-}" ]]; then
+  echo "Error: YT_ALBUM_DEST not set. Configure it in .env"
+  exit 1
+fi
+DEST_ROOT="$YT_ALBUM_DEST"
+
+# Build cookie args if browser specified
+cookie_args=()
+if [[ -n "${YT_COOKIES_BROWSER:-}" ]]; then
+  cookie_args=(--cookies-from-browser "$YT_COOKIES_BROWSER")
+fi
+
+# ---- Helper functions ----
+
+# Parse title from video title, stripping "Artist - " prefix and common suffixes
+parse_title_only() {
+  local input="$1"
+
+  # Remove common suffixes
+  local cleaned
+  cleaned="$(echo "$input" | sed -E 's/\s*\((Official Video|Official Music Video|Official Audio|Audio|Lyrics|Lyric Video|Music Video|HD|HQ|4K|Remastered|Remaster|Live|Acoustic)\)//gi')"
+  cleaned="$(echo "$cleaned" | sed -E 's/\s*\[(Official Video|Official Music Video|Official Audio|Audio|Lyrics|Lyric Video|Music Video|HD|HQ|4K|Remastered|Remaster|Live|Acoustic)\]//gi')"
+  cleaned="$(echo "$cleaned" | sed -E 's/\s*\([0-9]{4}\)//g')"
+  cleaned="$(echo "$cleaned" | sed -E 's/\s*\[[0-9]{4}\]//g')"
+  cleaned="$(echo "$cleaned" | sed -E 's/\s*(Official Video|Official Audio|Lyrics|Audio)\s*$//gi')"
+  cleaned="$(echo "$cleaned" | sed -E 's/\s*$//; s/^\s*//')"
+
+  # Try different separators: " - ", " – ", " — "
+  # If found, return just the title part (after the separator)
+  if [[ "$cleaned" =~ ^(.+)[[:space:]][-–—][[:space:]](.+)$ ]]; then
+    local title="${BASH_REMATCH[2]}"
+    # Trim whitespace
+    title="$(echo "$title" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    echo "$title"
+    return 0
+  fi
+
+  # No separator found - return the whole cleaned string as title
+  echo "$cleaned"
+  return 0
+}
+
+# Sanitize filename (remove problematic characters)
+sanitize_filename() {
+  echo "$1" | sed -E 's/[<>:"/\\|?*]//g; s/^\.+//; s/\.+$//; s/[[:space:]]+/ /g; s/^ //; s/ $//'
+}
+
+# ---- Main ----
+
+echo "Fetching playlist info..."
+playlist_json="$(yt-dlp "${cookie_args[@]}" --flat-playlist -J "$playlist_url" 2>/dev/null)"
+
+playlist_title="$(echo "$playlist_json" | jq -r '.title // "Unknown Playlist"')"
+video_count="$(echo "$playlist_json" | jq '.entries | length')"
+
+echo "Playlist: $playlist_title"
+echo "Videos: $video_count"
+echo
+
+if [[ "$video_count" -eq 0 ]]; then
+  echo "No videos found in playlist."
+  exit 1
+fi
+
+# ---- Prompt for album info upfront ----
+echo "Enter album details:"
+read -r -p "  Artist: " album_artist </dev/tty
+if [[ -z "$album_artist" ]]; then
+  echo "Artist is required."
+  exit 1
+fi
+
+read -r -p "  Album name: " album_name </dev/tty
+if [[ -z "$album_name" ]]; then
+  echo "Album name is required."
+  exit 1
+fi
+
+read -r -p "  Year: " album_year </dev/tty
+
+echo
+echo "Artist: $album_artist"
+echo "Album: $album_name"
+echo "Year: ${album_year:-"(not set)"}"
+echo
+
+# ---- Create album folder ----
+safe_artist="$(sanitize_filename "$album_artist")"
+safe_album="$(sanitize_filename "$album_name")"
+dest_dir="$DEST_ROOT/$safe_artist/$safe_album"
+mkdir -p "$dest_dir"
+
+echo "Destination: $dest_dir"
+echo
+
+# ---- Process each video ----
+tmpdir="$(mktemp -d)"
+trap 'rm -rf "$tmpdir"' EXIT
+
+current=0
+downloaded=0
+
+echo "$playlist_json" | jq -c '.entries[]' | while read -r entry; do
+  current=$((current + 1))
+
+  video_id="$(echo "$entry" | jq -r '.id')"
+  video_url="$(echo "$entry" | jq -r '.url')"
+  raw_title="$(echo "$entry" | jq -r '.title // empty')"
+
+  # If title missing from flat playlist, fetch individual track metadata
+  if [[ -z "$raw_title" ]]; then
+    track_json="$(yt-dlp "${cookie_args[@]}" -j "$video_url" 2>/dev/null || true)"
+    if [[ -n "$track_json" ]]; then
+      raw_title="$(echo "$track_json" | jq -r '.title // .track // "Unknown"')"
+    else
+      raw_title="Unknown"
+    fi
+  fi
+
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "[$current/$video_count] $raw_title"
+  echo "  $video_url"
+
+  # Parse title from video title (strips artist prefix if present)
+  detected_title="$(parse_title_only "$raw_title")"
+
+  echo
+  echo "  Detected title: ${detected_title:-"(not detected)"}"
+  echo
+
+  final_title="$detected_title"
+
+  if [[ "$auto_confirm" == true ]]; then
+    # Auto-confirm mode: skip if no title detected
+    if [[ -z "$final_title" ]]; then
+      echo "  Skipping (no title detected)"
+      continue
+    fi
+  else
+    # Interactive mode: prompt for confirmation
+    read -r -p "  [Enter=OK, e=edit, s=skip] " response </dev/tty
+    response_lower="$(echo "$response" | tr '[:upper:]' '[:lower:]')"
+
+    case "$response_lower" in
+      "")
+        # Use detected value, but prompt if empty
+        if [[ -z "$final_title" ]]; then
+          read -r -p "  Title: " final_title </dev/tty
+        fi
+        ;;
+      e|edit)
+        read -r -p "  Title [${detected_title:-}]: " input_title </dev/tty
+        final_title="${input_title:-$detected_title}"
+        ;;
+      s|skip)
+        echo "  Skipping"
+        continue
+        ;;
+      *)
+        echo "  Skipping"
+        continue
+        ;;
+    esac
+  fi
+
+  if [[ -z "$final_title" ]]; then
+    echo "  Skipping (missing title)"
+    continue
+  fi
+
+  echo "  Downloading: $album_artist - $final_title"
+
+  # Download to temp directory
+  yt-dlp \
+    "${cookie_args[@]}" \
+    --no-playlist \
+    -x --audio-format mp3 --audio-quality 0 \
+    -o "$tmpdir/%(id)s.%(ext)s" \
+    "$video_url" 2>/dev/null || {
+    echo "  Download failed, continuing..."
+    continue
+  }
+
+  # Find the downloaded file
+  downloaded_mp3="$(find "$tmpdir" -maxdepth 1 -type f -name "*.mp3" | head -n 1)"
+  if [[ -z "${downloaded_mp3:-}" ]]; then
+    echo "  No mp3 produced, continuing..."
+    continue
+  fi
+
+  # Tag the MP3
+  id3v2 \
+    -a "$album_artist" \
+    -A "$album_name" \
+    -t "$final_title" \
+    ${album_year:+-y "$album_year"} \
+    "$downloaded_mp3" >/dev/null
+
+  # Move to final location with proper filename
+  safe_title="$(sanitize_filename "$final_title")"
+  final_filename="${safe_title}.mp3"
+  final_path="$dest_dir/$final_filename"
+
+  # Handle duplicate filenames
+  if [[ -f "$final_path" ]]; then
+    counter=2
+    while [[ -f "$dest_dir/${safe_title} ($counter).mp3" ]]; do
+      counter=$((counter + 1))
+    done
+    final_filename="${safe_title} ($counter).mp3"
+    final_path="$dest_dir/$final_filename"
+  fi
+
+  mv "$downloaded_mp3" "$final_path"
+  echo "  Saved: $final_filename"
+
+  downloaded=$((downloaded + 1))
+  echo
+done
+
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "Album complete!"
+echo "Location: $dest_dir"
